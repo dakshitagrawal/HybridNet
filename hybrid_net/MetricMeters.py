@@ -1,5 +1,7 @@
 from .DataTransformer import NO_LABEL
 
+
+#Evaluation Metric Meter class
 class AverageMeterSet:
     def __init__(self):
         self.meters = {}
@@ -29,6 +31,7 @@ class AverageMeterSet:
         return {name + postfix: meter.count for name, meter in self.meters.items()}
 
 
+
 class AverageMeter:
     """Computes and stores the average and current value"""
 
@@ -49,6 +52,8 @@ class AverageMeter:
 
     def __format__(self, format):
         return "{self.val:{format}} ({self.avg:{format}})".format(self=self, format=format)
+
+
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""

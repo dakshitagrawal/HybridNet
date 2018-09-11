@@ -8,15 +8,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from hybrid_net import DataTransformer
-from hybrid_net import DataLoaderMaker
-from hybrid_net import ModelArchitecture
-from hybrid_net import MetricMeters
-from hybrid_net import HyperParameterSchedulers
-from hybrid_net import Losses
+from hybrid_net import DataTransformer, DataLoaderMaker, ModelArchitecture, MetricMeters, HyperParameterSchedulers, Losses
 
 from PIL import Image
 
+#####################################################
+##
+##               IMPORTANT PARAMETERS
+##
+#####################################################
 
 images = "./data-local/images/cifar10/by-image/"
 labels = "./data-local/labels/cifar10/1000_balanced_labels/00.txt"
@@ -24,34 +24,47 @@ train_subdir = "train"
 eval_subdir = "val"
 checkpoint_path = "./checkpoints/"
 device = "cuda" if torch.cuda.is_available() else 'cpu'
-
 workers = 4
 NO_LABEL = -1
 global_step = 0
 ema_decay = 0.999
 print_freq = 2
 best_prec1 = 0
-initial_lr = 0.003
-initial_beta1 = 0.9
 start_epoch = 0
 arch = "hybridNet1"
 
+
+# specified in the paper
+initial_lr = 0.003
+initial_beta1 = 0.9
+
 # batch_size is 100 in paper
-batch_size = 10
+batch_size = 100
 
 # batch_size is 20 in paper
-labeled_batch_size = 1
+labeled_batch_size = 20
 
+# total epochs not specified for 1000 label CIFAR training in paper
 total_epochs = 3
 
+
+#####################################################
+##
+##               HELPING FUNCTIONS
+##
+#####################################################
+
+# function to update the secondary model (used for stability loss)
 def update_ema_variables(model, ema_model, alpha, global_step):
     # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
 
+
+# function to save checkpoints of the model after every epoch
 def save_checkpoint(state, is_best, dirpath, epoch):
-    filename = 'checkpoint.{}.ckpt'.format(epoch)
+    filename = 'checkpoint-{}.ckpt'.format(epoch)
     checkpoint_path = os.path.join(dirpath, filename)
     best_path = os.path.join(dirpath, 'best.ckpt')
     torch.save(state, checkpoint_path)
@@ -59,6 +72,13 @@ def save_checkpoint(state, is_best, dirpath, epoch):
     if is_best:
         shutil.copyfile(checkpoint_path, best_path)
         print('--- checkpoint copied to %s ---'.format(best_path))
+
+
+#####################################################
+##
+##               DATALOADER PREPARATION
+##
+#####################################################
 
 train_transformation, eval_transformation = DataTransformer.transformer()
 
@@ -72,16 +92,37 @@ train_loader, eval_loader = DataLoaderMaker.create_data_loaders(train_transforma
                                                 labeled_batch_size,
                                                 workers)
 
+
+#####################################################
+##
+##                  MODEL PREPARATION
+##
+#####################################################
+
+
+# 'model' is the actual model to be trained
+# 'ema_model' is a duplicate model for stability loss as mentioned in paper
+
 model = ModelArchitecture.create_model()
 ema_model = ModelArchitecture.create_model(ema=True)
 
+
+#####################################################
+##
+##          TRAIN AND VALIDATION FUNCTIONS
+##
+#####################################################
+
 def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epochs, print_freq = 2):
     global global_step
-
+    
+    
+    # initialize loss functions
     class_criterion = nn.CrossEntropyLoss(size_average=False, ignore_index=NO_LABEL).to(device)
     reconstruction_criterion = Losses.symmetric_mse_loss   
     stability_criterion = Losses.softmax_mse_loss
-
+    
+    # initialize evaluation metric meter
     meters = MetricMeters.AverageMeterSet()
 
     # switch to train mode
@@ -89,13 +130,18 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
     ema_model.train()
 
     end = time.time()
+    
     for i, ((input, ema_input), target) in enumerate(train_loader):
         # measure data loading time
         meters.update('data_time', time.time() - end)
         
+        # update hyperparameters according to details given in the paper
         HyperParameterSchedulers.adjust_learning_rate(optimizer, initial_lr, epoch, total_epochs)
         HyperParameterSchedulers.adjust_beta_1(optimizer, initial_beta1, epoch, total_epochs)
-        lambda_c = HyperParameterSchedulers.exponential_increase(i, 800)
+        if epoch == 0:
+            lambda_c = HyperParameterSchedulers.exponential_increase(i, 800)
+        else: 
+            lambda_c = 1.0
         lambda_r = 100 * HyperParameterSchedulers.adjust_lambda_r(epoch, 0.25 * total_epochs, 0.8 * total_epochs, total_epochs)
         lambda_s = HyperParameterSchedulers.exponential_decrease(epoch, 0.95 * total_epochs, total_epochs)
         meters.update('lr', optimizer.param_groups[0]['lr'])
@@ -103,11 +149,12 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
         meters.update('lambda_c', lambda_c)
         meters.update('lambda_r', lambda_r)
         meters.update('lambda_s', lambda_s)
-
+        
+        # prepare input and target 
         input_var = torch.autograd.Variable(input)
         ema_input_var = torch.autograd.Variable(ema_input, volatile=True)
         target_var = torch.autograd.Variable(target.cuda(async=True))
-
+        
         input_var = input_var.to(device)
         ema_input_var = ema_input_var.to(device)
 
@@ -116,10 +163,13 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
         
         assert labeled_minibatch_size > 0
         meters.update('labeled_minibatch_size', labeled_minibatch_size)
-
+        
+        
+        # forward pass through two models
         ema_y, ema_x_c, ema_x_u = ema_model(ema_input_var)
         model_y, model_x_c, model_x_u = model(input_var)
 
+        # get logits of outputs from the model
         ema_logit = Variable(ema_y.detach().data, requires_grad=False)
         cons_logit = model_y
         class_logit = model_y
@@ -139,6 +189,7 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
         #
         #
         #
+        reconstruction_loss_bl = 0
         
         # balanced reconstruction loss
         if torch.sum((model_x_c - input_var)**2) <= torch.sum((model_x_u - input_var)**2):
@@ -152,19 +203,22 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
         meters.update('stability_loss', stability_loss.data[0])
 
 
-        loss = lambda_c * class_loss + lambda_r * reconstruction_loss + lambda_s * stability_loss 
+        # final loss as given in paper
+        loss = lambda_c * class_loss + lambda_r * reconstruction_loss + lambda_r * reconstruction_loss_bl + lambda_s * stability_loss 
         
-        
+        # ensure the loss is not exploding
         assert not (np.isnan(loss.data[0]) or loss.data[0] > 1e5), 'Loss explosion: {}'.format(loss.data[0])
         
         meters.update('loss', loss.data[0])
 
+        # evaluate performance of model after training
         prec1, prec5 = MetricMeters.accuracy(class_logit.data, target_var.data, topk=(1, 5))
         meters.update('top1', prec1[0], labeled_minibatch_size)
         meters.update('error1', 100. - prec1[0], labeled_minibatch_size)
         meters.update('top5', prec5[0], labeled_minibatch_size)
         meters.update('error5', 100. - prec5[0], labeled_minibatch_size)
-
+        
+        # evaluate performance of ema_model after training
         ema_prec1, ema_prec5 = MetricMeters.accuracy(ema_logit.data, target_var.data, topk=(1, 5))
         meters.update('ema_top1', ema_prec1[0], labeled_minibatch_size)
         meters.update('ema_error1', 100. - ema_prec1[0], labeled_minibatch_size)
@@ -177,12 +231,14 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
         optimizer.step()
         global_step += 1
         
+        # update parameters of 'ema_model' as it is not trained
         update_ema_variables(model, ema_model, ema_decay, global_step)
 
         # measure elapsed time
         meters.update('batch_time', time.time() - end)
         end = time.time()
 
+        # print training evaluation metrics
         if i % print_freq == 0:
             print(
                 'Epoch: [{0}][{1}/{2}]\t'
@@ -192,7 +248,11 @@ def train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epo
                     epoch, i, len(train_loader), meters=meters))
 
 def validate(eval_loader, model, global_step, epoch, print_freq = 2):
+    
+    # initialize loss functions
     class_criterion = nn.CrossEntropyLoss(size_average=False, ignore_index=NO_LABEL).to(device)
+    
+    # initialize evaluation metric meter
     meters = MetricMeters.AverageMeterSet()
 
     # switch to evaluate mode
@@ -200,8 +260,11 @@ def validate(eval_loader, model, global_step, epoch, print_freq = 2):
 
     end = time.time()
     for i, (input, target) in enumerate(eval_loader):
+        # measure data loading time
         meters.update('data_time', time.time() - end)
-
+        
+        
+        # prepare input and target
         input_var = torch.autograd.Variable(input, volatile=True)
         target_var = torch.autograd.Variable(target.cuda(async=True), volatile=True)
 
@@ -212,7 +275,7 @@ def validate(eval_loader, model, global_step, epoch, print_freq = 2):
         assert labeled_minibatch_size > 0
         meters.update('labeled_minibatch_size', labeled_minibatch_size)
 
-        # compute output
+        # forward pass through the model
         model_y, model_x_c, model_x_u = model(input_var)
         softmax_model_y = F.softmax(model_y, dim=1)
         class_loss = class_criterion(model_y, target_var) / minibatch_size
@@ -229,6 +292,7 @@ def validate(eval_loader, model, global_step, epoch, print_freq = 2):
         meters.update('batch_time', time.time() - end)
         end = time.time()
 
+        # print evaluation metric for particular batches
         if i % print_freq == 0:
             print(
                 'Test: [{0}/{1}]\t'
@@ -237,20 +301,29 @@ def validate(eval_loader, model, global_step, epoch, print_freq = 2):
                 'Prec@5 {meters[top5]:.3f}'.format(
                     i, len(eval_loader), meters=meters))
 
+    # print overall evaluation metric for the model
     print(' * Prec@1 {top1.avg:.3f}\tPrec@5 {top5.avg:.3f}'
           .format(top1=meters['top1'], top5=meters['top5']))
 
     return meters['top1'].avg
 
+#####################################################
+##
+##          RUNNING THE MODEL
+##
+#####################################################
 
+# use Adam optimizer as mentioned in the paper
 optimizer = torch.optim.Adam(model.parameters(), lr = initial_lr)
 
 for epoch in range(start_epoch, total_epochs):
+    # training
     start_time = time.time()
     train(train_loader, model, ema_model, optimizer, epoch, ema_decay, total_epochs, print_freq)
     time_elapsed = time.time() - start_time
     print('epoch training complete in {: .0f}m {:0f}s'.format(time_elapsed // 60, time_elapsed % 60))
     
+    #validation
     start_time = time.time()
     print("Evaluating the primary model:")
     prec1 = validate(eval_loader, model, global_step, epoch, print_freq = 2)
@@ -259,10 +332,11 @@ for epoch in range(start_epoch, total_epochs):
     time_elapsed = time.time() - start_time
     print('epoch validation complete in {: .0f}m {:0f}s'.format(time_elapsed // 60, time_elapsed % 60))
     
+    # best precision updation
     is_best = ema_prec1 > best_prec1
     best_prec1 = max(ema_prec1, best_prec1)
     
-    
+    # saving a checkpoint of the model after the epoch
     save_checkpoint({
         'epoch': epoch + 1,
         'global_step': global_step,
@@ -272,4 +346,3 @@ for epoch in range(start_epoch, total_epochs):
         'best_prec1': best_prec1,
         'optimizer' : optimizer.state_dict(),
     }, is_best, checkpoint_path, epoch + 1)
-
